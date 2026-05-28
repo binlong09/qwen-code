@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from openai import OpenAI
 from rich.console import Console
+from rich.panel import Panel
 
 # ---------- Config ----------
 MODEL = "qwen3-coder:30b"
@@ -22,6 +23,8 @@ MAX_ITERATIONS = 25
 # may overwrite it from --project-root. Tools read this name fresh on each call,
 # so reassignment from main() takes effect immediately.
 WORKING_DIR = Path.cwd().resolve()
+# YOLO_MODE bypasses all approval prompts. Set from --yolo.
+YOLO_MODE = False
 
 READ_FILE_MAX_LINES = 2000
 BASH_TIMEOUT = 30
@@ -314,7 +317,40 @@ def replace_in_file(path: str, diff: str) -> str:
     return f"Applied {n} block{'s' if n != 1 else ''} to {path}"
 
 
-def bash(command: str) -> str:
+def _prompt_approval(command: str) -> bool:
+    """Show the command in a distinct panel and prompt for y/N.
+
+    Returns True if the user typed y/yes. EOF or interrupt is treated as denial.
+    YOLO_MODE callers should short-circuit before calling this.
+    """
+    console.print(
+        Panel(
+            command,
+            title="[bold yellow]approval required[/]",
+            border_style="yellow",
+            expand=False,
+        )
+    )
+    try:
+        ans = console.input(r"[bold yellow]Approve?[/] \[y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        console.print()
+        return False
+    return ans in {"y", "yes"}
+
+
+def bash(command: str, requires_approval: bool) -> str:
+    if requires_approval:
+        if YOLO_MODE:
+            console.print("[dim yellow]  (requires_approval=true; auto-approved by --yolo)[/]")
+        elif not _prompt_approval(command):
+            return (
+                f"User denied approval. The command was NOT executed.\n"
+                f"  command: {command}\n"
+                f"  hint: if the user denied, adjust the approach (a safer command, "
+                f"or explain why this is needed) before retrying."
+            )
+
     try:
         result = subprocess.run(
             command,
@@ -433,14 +469,27 @@ TOOLS: list[dict] = [
                 "tool call. To run in a subdirectory, prepend `cd <path> && ` to the "
                 "command on every call. Returns exit code, stdout, and stderr — each "
                 "stream is captured and truncated to 5000 chars. Prefer `rg` (ripgrep) "
-                "for code search."
+                "for code search.\n\n"
+                "You MUST set requires_approval: true for commands that modify state "
+                "outside the working directory, install software, delete files, make "
+                "network requests, or could be destructive in any way. Set false for "
+                "read-only commands like `ls`, `cat`, `grep`, `pwd`, `python script.py` "
+                "(when the script is known-safe), and most test runs. When in doubt, true."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Shell command to execute."}
+                    "command": {"type": "string", "description": "Shell command to execute."},
+                    "requires_approval": {
+                        "type": "boolean",
+                        "description": (
+                            "true if the command should require user approval before "
+                            "running (destructive, network, install, deletes, etc.); "
+                            "false for read-only operations and known-safe scripts."
+                        ),
+                    },
                 },
-                "required": ["command"],
+                "required": ["command", "requires_approval"],
             },
         },
     },
@@ -632,6 +681,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
              "Defaults to the current working directory.",
     )
     parser.add_argument(
+        "--yolo",
+        action="store_true",
+        help="Auto-approve every bash command, even when the model marks "
+             "requires_approval=true. Off by default. USE WITH CAUTION.",
+    )
+    parser.add_argument(
         "task",
         nargs="*",
         help="Task description. If omitted, drops into an interactive REPL.",
@@ -642,7 +697,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 def main() -> None:
     args = _parse_args(sys.argv[1:])
 
-    global WORKING_DIR
+    global WORKING_DIR, YOLO_MODE
     if args.project_root is not None:
         root = Path(args.project_root).expanduser()
         try:
@@ -654,6 +709,13 @@ def main() -> None:
             console.print(f"[red]--project-root is not a directory:[/] {resolved}")
             sys.exit(2)
         WORKING_DIR = resolved
+
+    YOLO_MODE = bool(args.yolo)
+    if YOLO_MODE:
+        console.print(
+            "[bold red]WARNING:[/] --yolo is set. All bash commands will be "
+            "auto-approved, including ones the model marks as destructive."
+        )
 
     console.print(f"[dim]model:[/] {MODEL}  [dim]working dir:[/] {WORKING_DIR}")
 
