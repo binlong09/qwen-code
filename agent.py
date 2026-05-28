@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Minimal Claude Code clone — v0. Single-file agent with 4 tools."""
+"""Minimal Claude Code clone — v0.1. Single-file agent with 4 tools."""
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import subprocess
@@ -17,6 +18,9 @@ MODEL = "qwen3-coder:30b"
 BASE_URL = "http://openai:11434/v1"
 API_KEY = "ollama"  # any non-empty string; Ollama ignores it
 MAX_ITERATIONS = 25
+# WORKING_DIR is the root for all tool paths. Defaults to cwd at import; main()
+# may overwrite it from --project-root. Tools read this name fresh on each call,
+# so reassignment from main() takes effect immediately.
 WORKING_DIR = Path.cwd().resolve()
 
 READ_FILE_MAX_LINES = 2000
@@ -29,25 +33,78 @@ console = Console()
 
 
 # ---------- Path safety ----------
+class PathError(ValueError):
+    """Raised when a path cannot be resolved inside the working directory.
+
+    The message is preformatted with the resolved path, working directory, and a
+    hint, so tools can return str(exc) directly to the model.
+    """
+
+
 def _resolve_path(path: str) -> Path:
+    """Resolve `path` to an absolute path inside WORKING_DIR.
+
+    Uses Path.resolve() so symlinks are followed; the resolved real path must be
+    a descendant of the resolved working directory or PathError is raised.
+    """
+    wd = WORKING_DIR  # snapshot — WORKING_DIR is a module global, may change
     p = Path(path)
-    resolved = (p if p.is_absolute() else WORKING_DIR / p).resolve()
     try:
-        resolved.relative_to(WORKING_DIR)
-    except ValueError:
-        raise ValueError(
-            f"Path {path!r} resolves outside the working directory ({WORKING_DIR})"
+        resolved = (p if p.is_absolute() else wd / p).resolve()
+    except Exception as e:
+        raise PathError(
+            f"could not resolve path {path!r}: {type(e).__name__}: {e}\n"
+            f"  working directory: {wd}"
         )
+    if resolved != wd:
+        try:
+            resolved.relative_to(wd)
+        except ValueError:
+            raise PathError(
+                f"path resolves outside the working directory: {path!r}\n"
+                f"  resolved to: {resolved}\n"
+                f"  working directory: {wd}\n"
+                f"  hint: pass a path relative to the working directory, "
+                f"or an absolute path that lies inside it. Symlinks pointing "
+                f"outside are rejected."
+            )
     return resolved
+
+
+def _show_lines(path: Path, start: int, end: int) -> str:
+    """Return lines [start, end] (1-indexed, inclusive, clamped) with line-number prefix."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"  (could not read file for context: {type(e).__name__}: {e})"
+    lines = text.splitlines()
+    s = max(1, start)
+    e = min(len(lines), end)
+    if s > e:
+        return "  (no lines to display)"
+    return "\n".join(f"  {i:>4}\t{lines[i - 1]}" for i in range(s, e + 1))
 
 
 # ---------- Tools ----------
 def read_file(path: str) -> str:
-    p = _resolve_path(path)
+    try:
+        p = _resolve_path(path)
+    except PathError as e:
+        return f"Error: {e}"
     if not p.exists():
-        return f"Error: file not found: {path}"
+        return (
+            f"Error: file not found: {path}\n"
+            f"  resolved to: {p}\n"
+            f"  working directory: {WORKING_DIR}\n"
+            f"  hint: if the file is elsewhere, pass an absolute path or a path "
+            f"relative to the working directory."
+        )
     if not p.is_file():
-        return f"Error: not a regular file: {path}"
+        return (
+            f"Error: not a regular file: {path}\n"
+            f"  resolved to: {p}\n"
+            f"  working directory: {WORKING_DIR}"
+        )
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
@@ -63,11 +120,16 @@ def read_file(path: str) -> str:
 
 
 def write_file(path: str, content: str) -> str:
-    p = _resolve_path(path)
+    try:
+        p = _resolve_path(path)
+    except PathError as e:
+        return f"Error: {e}"
     if p.exists():
         return (
-            f"Error: file already exists: {path}. "
-            f"Use str_replace to edit existing files."
+            f"Error: file already exists: {path}\n"
+            f"  resolved to: {p}\n"
+            f"  working directory: {WORKING_DIR}\n"
+            f"  hint: write_file only creates new files. To edit, use str_replace."
         )
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
@@ -79,30 +141,59 @@ def write_file(path: str, content: str) -> str:
 
 
 def str_replace(path: str, old_str: str, new_str: str) -> str:
-    p = _resolve_path(path)
+    try:
+        p = _resolve_path(path)
+    except PathError as e:
+        return f"Error: {e}"
     if not p.exists():
-        return f"Error: file not found: {path}"
+        return (
+            f"Error: file not found: {path}\n"
+            f"  resolved to: {p}\n"
+            f"  working directory: {WORKING_DIR}\n"
+            f"  hint: pass a path relative to the working directory."
+        )
     text = p.read_text(encoding="utf-8")
     count = text.count(old_str)
+
     if count == 0:
+        preview = _show_lines(p, 1, 20)
+        total_lines = text.count("\n") + (0 if text.endswith("\n") or text == "" else 1)
         return (
-            f"Error: old_str not found in {path}. "
-            f"Re-read the file and copy text exactly. "
+            f"Error: old_str not found in {path}.\n"
+            f"  resolved to: {p}\n"
+            f"  file is {total_lines} lines; first 20 shown below:\n"
+            f"{preview}\n"
+            f"  hint: the string was not found — check for whitespace, indentation, "
+            f"or character differences (e.g. tabs vs spaces, trailing spaces, line endings). "
             f"Do NOT include the right-aligned line-number prefix from read_file output."
         )
+
     if count > 1:
-        match_lines: list[int] = []
+        # Locate every match with its starting line and ending line.
+        matches: list[tuple[int, int]] = []  # (start_line, end_line)
         idx = 0
         while True:
             i = text.find(old_str, idx)
             if i == -1:
                 break
-            match_lines.append(text.count("\n", 0, i) + 1)
+            start_line = text.count("\n", 0, i) + 1
+            end_line = start_line + old_str.count("\n")
+            matches.append((start_line, end_line))
             idx = i + 1
+        match_lines = [s for s, _ in matches]
+        ctx_blocks: list[str] = []
+        for n, (s, e) in enumerate(matches, 1):
+            ctx_blocks.append(
+                f"  Match {n} (lines {s}-{e}):\n{_show_lines(p, s - 2, e + 2)}"
+            )
         return (
-            f"Error: old_str matched {count} times in {path} at lines {match_lines}. "
-            f"Include more surrounding context to make the match unique."
+            f"Error: old_str matched {count} times in {path} at lines {match_lines}.\n"
+            f"  resolved to: {p}\n"
+            + "\n".join(ctx_blocks)
+            + "\n  hint: include more surrounding lines in old_str (above or below "
+            "the target) to uniquely identify the match you want to change."
         )
+
     p.write_text(text.replace(old_str, new_str, 1), encoding="utf-8")
     return f"Replaced 1 occurrence in {path}"
 
@@ -178,10 +269,14 @@ TOOLS: list[dict] = [
         "function": {
             "name": "str_replace",
             "description": (
-                "Exact string replacement in an existing file. `old_str` must appear EXACTLY ONCE. "
-                "Do not include the line-number prefix from read_file output. "
-                "On multiple matches, the error returns each match's line number — add more context "
-                "around `old_str` to disambiguate."
+                "Exact string replacement in an existing file. `old_str` must match the file "
+                "content character-for-character including whitespace and indentation. "
+                "Line-number prefixes shown by read_file (format: '   N<tab>...') are "
+                "display-only — do NOT include them in `old_str`. `old_str` must appear "
+                "EXACTLY ONCE; if it matches multiple locations, include more surrounding "
+                "lines until it is unique. On 0 matches the error shows the start of the "
+                "file; on >1 matches it shows context around each match so you can "
+                "disambiguate."
             ),
             "parameters": {
                 "type": "object",
@@ -199,8 +294,14 @@ TOOLS: list[dict] = [
         "function": {
             "name": "bash",
             "description": (
-                "Run a shell command in the working directory. 30-second timeout. "
-                "Returns exit code, stdout, and stderr. Prefer `rg` (ripgrep) for code search."
+                "Run a shell command from the working directory. 30-second timeout. "
+                "Runs in a FRESH subprocess each call — state does NOT persist between "
+                "calls: `cd`, environment variable changes (`export VAR=...`), shell "
+                "variable assignments, and background processes all reset before the next "
+                "tool call. To run in a subdirectory, prepend `cd <path> && ` to the "
+                "command on every call. Returns exit code, stdout, and stderr — each "
+                "stream is captured and truncated to 5000 chars. Prefer `rg` (ripgrep) "
+                "for code search."
             ),
             "parameters": {
                 "type": "object",
@@ -234,8 +335,8 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
 
 
 # ---------- System prompt ----------
-SYSTEM_PROMPT = """You are a focused coding agent operating in a single working directory \
-via four tools: read_file, write_file, str_replace, bash.
+_BASE_SYSTEM_PROMPT = """You are a focused coding agent operating in a single working \
+directory via four tools: read_file, write_file, str_replace, bash.
 
 Rules:
 - Always read a file before editing it. Match old_str byte-for-byte from the file contents.
@@ -247,10 +348,29 @@ Rules:
 - If a tool returns an error, read it carefully and adjust — do not repeat the same call.
 - When str_replace reports multiple matches, add more surrounding context to old_str until
   it is unique.
-- Be terse in your final response. State what you did and the outcome. No filler.
+- Be terse in your final response. State what you did, which file you changed, and why.
 - Never invent file contents. If you need to know what's in a file, read it.
 - Stop iterating once the task is verifiably done.
 """
+
+
+def _build_system_prompt() -> str:
+    """Prepend the working-directory invariants paragraph to the base prompt.
+
+    The paragraph names the actual resolved working directory so the model can
+    reason about path resolution and the fresh-subprocess nature of bash.
+    """
+    wd_intro = (
+        f"Your working directory is {WORKING_DIR}. "
+        f"The read_file, write_file, and str_replace tools resolve paths relative "
+        f"to this directory (or accept absolute paths within it). "
+        f"The bash tool also runs from this directory in a fresh subprocess each "
+        f"call — `cd` inside a bash command will NOT persist to the next tool "
+        f"call. To operate in a subdirectory, either pass relative paths to file "
+        f"tools, or prepend `cd <subdir> && ` to every bash command. Do not "
+        f"assume state carries between bash calls.\n\n"
+    )
+    return wd_intro + _BASE_SYSTEM_PROMPT
 
 
 # ---------- UI helpers ----------
@@ -271,7 +391,7 @@ def _print_tool_result(result: str) -> None:
 def run_agent(user_task: str, history: list[dict] | None = None) -> list[dict]:
     client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
     messages = history if history is not None else [
-        {"role": "system", "content": SYSTEM_PROMPT}
+        {"role": "system", "content": _build_system_prompt()}
     ]
     messages.append({"role": "user", "content": user_task})
 
@@ -365,18 +485,52 @@ def run_agent(user_task: str, history: list[dict] | None = None) -> list[dict]:
 
 
 # ---------- CLI ----------
-def main() -> None:
-    args = sys.argv[1:]
-    console.print(f"[dim]model:[/] {MODEL}  [dim]cwd:[/] {WORKING_DIR}")
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="qwen-code",
+        description="Minimal Claude Code clone — local Qwen via Ollama.",
+    )
+    parser.add_argument(
+        "--project-root",
+        type=str,
+        default=None,
+        help="Working directory for all tools (absolute or relative to launch cwd). "
+             "Defaults to the current working directory.",
+    )
+    parser.add_argument(
+        "task",
+        nargs="*",
+        help="Task description. If omitted, drops into an interactive REPL.",
+    )
+    return parser.parse_args(argv)
 
-    if args:
-        task = " ".join(args)
+
+def main() -> None:
+    args = _parse_args(sys.argv[1:])
+
+    global WORKING_DIR
+    if args.project_root is not None:
+        root = Path(args.project_root).expanduser()
+        try:
+            resolved = root.resolve(strict=True)
+        except FileNotFoundError:
+            console.print(f"[red]--project-root does not exist:[/] {root}")
+            sys.exit(2)
+        if not resolved.is_dir():
+            console.print(f"[red]--project-root is not a directory:[/] {resolved}")
+            sys.exit(2)
+        WORKING_DIR = resolved
+
+    console.print(f"[dim]model:[/] {MODEL}  [dim]working dir:[/] {WORKING_DIR}")
+
+    if args.task:
+        task = " ".join(args.task)
         console.print(f"[bold]Task:[/] {task}\n")
         run_agent(task)
         return
 
     console.print("[bold]qwen-code[/] interactive. Type 'exit' or Ctrl-D to quit.")
-    history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    history: list[dict] = [{"role": "system", "content": _build_system_prompt()}]
     while True:
         try:
             line = console.input("[bold green]> [/]")

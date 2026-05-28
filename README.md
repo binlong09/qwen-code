@@ -1,11 +1,32 @@
-# qwen-code (v0)
+# qwen-code (v0.1)
 
 A minimal Claude Code clone: a single-file CLI coding agent that uses a local Qwen model
 (via Ollama) as the brain, with four tools — `read_file`, `write_file`, `str_replace`, and
 `bash`.
 
-This is **v0**. The goal is a working agentic loop in one file (`agent.py`, ~370 lines) that
-can read a small codebase, make an edit, and run a test, autonomously.
+The goal is a working agentic loop in one file (`agent.py`) that can read a small codebase,
+make an edit, and run a test, autonomously.
+
+## What changed in v0.1
+
+The harness was made **self-describing** so the model can reason about it correctly:
+
+- **`--project-root` CLI flag** — set the working directory explicitly instead of relying
+  on launch cwd.
+- **Working-directory paragraph in the system prompt** — the model is told the exact
+  absolute path of its working directory, that file tools resolve paths against it, and
+  that `bash` runs in a *fresh subprocess each call* so `cd` does not persist.
+- **Informative path errors** — `file not found`, `file already exists`, and
+  `outside working directory` errors now show the resolved path, the working directory,
+  and a hint.
+- **Actionable `str_replace` failures** — on zero matches the response includes the first
+  20 lines of the file; on multiple matches it includes the line numbers and 2 lines of
+  context around each match, with a hint to add more surrounding context.
+- **Expanded `bash` and `str_replace` tool descriptions** make the subprocess-isolation
+  and display-only-line-numbers invariants explicit in the tool schema.
+- **Path-safety hardening** — `_resolve_path` now follows symlinks via `Path.resolve()`
+  and verifies the resolved real path is a descendant of the resolved working directory,
+  rejecting both `..` traversal and symlinks pointing outside.
 
 ## Prereqs
 
@@ -53,8 +74,15 @@ python agent.py
 > exit
 ```
 
-The working directory is whatever you launch from — file tools cannot escape it, and `bash`
-runs with that as `cwd`.
+Point the agent at a different directory without `cd`-ing:
+
+```bash
+python agent.py --project-root /tmp/qwen-test-1 "Run test_main.py and make it pass."
+```
+
+The working directory is the resolved value of `--project-root` (or the launch cwd if the
+flag is omitted). File tools cannot escape it; `bash` runs with that as `cwd`, in a fresh
+subprocess each call.
 
 ## How it works
 
