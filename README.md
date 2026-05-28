@@ -1,12 +1,35 @@
-# qwen-code (v1.0)
+# qwen-code (v1.1)
 
 A minimal Claude Code clone: a single-file CLI coding agent that uses a local Qwen model
-(via Ollama) as the brain, with five tools — `read_file`, `write_file`, `replace_in_file`,
-`search`, and `bash`.
+(via Ollama) as the brain, with six tools — `read_file`, `write_file`, `replace_in_file`,
+`search`, `bash`, and `task_complete`.
 
 The goal is a working agentic loop in one file (`agent.py`) that can read a small codebase,
-locate content with ripgrep, make edits, run tests, and ask for approval before risky
-shell commands — autonomously.
+locate content with ripgrep, make edits, run tests, ask for approval before risky shell
+commands, and explicitly signal completion with verified evidence — autonomously.
+
+## What changed in v1.1
+
+Structured task termination with evidence verification — to push back against the
+sycophancy / fabrication failure mode caught by test 4.
+
+- **`task_complete(summary, files_changed, evidence)` tool** — replaces the v1.0
+  "model emits text with no tool calls" termination signal. The loop now ends *only*
+  when this tool is called and validates. If the model emits a final-looking response
+  without calling it, the harness appends a nudge and continues iterating.
+- **Required `evidence` field, harness-verified** — every path in `evidence` must have
+  been read via `read_file` or returned as a match (or been the search target) of a
+  `search` call earlier in this session. Unverified citations fail the call with an
+  error naming each one, asking the model to either drop the citation or read the file
+  before retrying. Catches both fabricated edits and unverified claims.
+- **System-prompt examples for "no change needed"** — explicit examples show that
+  `files_changed=[]` is a valid, complete outcome when no edit was required. The model
+  is instructed not to invent a bug or pretend to find one.
+
+`SESSION_ACCESSED` (the set of resolved Paths the agent has touched) is populated by
+`read_file` on success and by `search` (both the search target and every file that
+returned a match — parsed from `rg`'s `path:line:content` output). It persists across
+REPL turns alongside conversation history.
 
 ## What changed in v1.0
 
@@ -131,13 +154,17 @@ subprocess each call.
 | `replace_in_file` | Apply one or more fenced SEARCH/REPLACE blocks; all-or-nothing.          |
 | `search`          | Regex search via ripgrep across files; ≤ 100 matches.                    |
 | `bash`            | Run a shell command (30s timeout). Requires the model to flag risky commands via `requires_approval`. |
+| `task_complete`   | End the session with a summary, `files_changed`, and harness-verified `evidence`. The only way to terminate the loop. |
 
 ## How it works
 
 - The OpenAI Python client points at Ollama's OpenAI-compatible endpoint and uses native
   tool calling.
 - Each iteration: stream the model's text to the terminal, collect any tool calls, execute
-  them, feed results back as `tool` messages, repeat — up to `MAX_ITERATIONS` (25).
+  them, feed results back as `tool` messages, repeat — up to `MAX_ITERATIONS` (25). The
+  loop exits only when `task_complete` is called and its `evidence` validates against
+  `SESSION_ACCESSED`. If the model produces text with no tool calls, the harness appends
+  a `user` nudge asking it to call `task_complete` and continues.
 - Tool calls are printed in cyan with their arguments truncated to 200 chars; tool results
   are previewed at 500 chars in the UI, but the full result is fed back to the model.
 - `bash` results are formatted as `exit code: N` + `--- stdout ---` + `--- stderr ---`,
@@ -194,7 +221,7 @@ python ~/projects/qwen-code/agent.py "run calc.py, if it fails fix the bug and r
 Expected behavior: the agent runs `calc.py`, sees the `AssertionError`, reads `calc.py`,
 uses `replace_in_file` to change `a - b` to `a + b`, re-runs, sees `ok`, and reports success.
 
-## Out of scope for v1.0
+## Out of scope for v1.1
 
 `list_directory`, repo map / tree-sitter indexing, web fetch, MCP support, subagents,
-conversation persistence, multi-file refactor across many edits. v1.1+ territory.
+conversation persistence, multi-file refactor across many edits. v1.2+ territory.

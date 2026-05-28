@@ -26,6 +26,12 @@ MAX_ITERATIONS = 25
 WORKING_DIR = Path.cwd().resolve()
 # YOLO_MODE bypasses all approval prompts. Set from --yolo.
 YOLO_MODE = False
+# Set of absolute resolved Paths the agent has read or searched in this session.
+# Persists across REPL turns. Used by task_complete to verify evidence citations.
+SESSION_ACCESSED: set[Path] = set()
+# Set by task_complete on success; the agent loop checks it after each iteration
+# to exit cleanly. Reset at the start of every run_agent() call.
+_RUN_COMPLETE = False
 
 READ_FILE_MAX_LINES = 2000
 BASH_TIMEOUT = 30
@@ -114,6 +120,7 @@ def read_file(path: str) -> str:
         text = p.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         return f"Error reading {path}: {type(e).__name__}: {e}"
+    SESSION_ACCESSED.add(p)
     lines = text.splitlines()
     total = len(lines)
     note = ""
@@ -426,6 +433,20 @@ def search(pattern: str, path: str = ".", case_sensitive: bool = False) -> str:
 
     out = result.stdout.rstrip("\n")
     lines = out.split("\n") if out else []
+
+    # Record the searched path itself as accessed.
+    SESSION_ACCESSED.add(target)
+    # Record each file that produced a match. rg --no-heading lines start with
+    # "path:line:content"; the path is everything before the first colon.
+    for line in lines:
+        if ":" not in line:
+            continue
+        path_part = line.split(":", 1)[0]
+        try:
+            SESSION_ACCESSED.add((WORKING_DIR / path_part).resolve())
+        except Exception:
+            pass
+
     total = len(lines)
     if total > SEARCH_MAX_MATCHES:
         body = "\n".join(lines[:SEARCH_MAX_MATCHES])
@@ -435,6 +456,64 @@ def search(pattern: str, path: str = ".", case_sensitive: bool = False) -> str:
             f"narrow the pattern or path]"
         )
     return body if (body := "\n".join(lines)) else f"No matches for pattern {pattern!r} in {search_path}"
+
+
+def task_complete(summary: str, files_changed: list[str], evidence: list[str]) -> str:
+    """End the agent run. The summary is the final answer shown to the user.
+
+    `evidence` is verified: every path must have been read via read_file or
+    appeared in / been the argument of a search call earlier in this session.
+    Unverified paths abort completion with an error so the model can either
+    drop the citation or actually read the file before retrying.
+    """
+    if not isinstance(files_changed, list) or not isinstance(evidence, list):
+        return (
+            "Error: files_changed and evidence must both be JSON arrays of strings."
+        )
+
+    unverified: list[tuple[str, str]] = []
+    for ev in evidence:
+        if not isinstance(ev, str):
+            unverified.append((repr(ev), "evidence entry must be a string"))
+            continue
+        try:
+            p = _resolve_path(ev)
+        except PathError as e:
+            unverified.append((ev, str(e).splitlines()[0]))
+            continue
+        if p not in SESSION_ACCESSED:
+            unverified.append((ev, "was not read or searched in this session"))
+
+    if unverified:
+        rows = "\n".join(f"  {ev!r}: {why}" for ev, why in unverified)
+        return (
+            f"Error: cannot complete — {len(unverified)} evidence path"
+            f"{'s' if len(unverified) != 1 else ''} unverified:\n"
+            f"{rows}\n"
+            f"  hint: either remove the unverified citation from evidence (if the "
+            f"claim is unsupported) or call read_file / search on it before retrying "
+            f"task_complete. Do not invent supporting files."
+        )
+
+    global _RUN_COMPLETE
+    _RUN_COMPLETE = True
+
+    console.print(
+        Panel(
+            summary.strip() or "(empty summary)",
+            title="[bold green]task complete[/]",
+            border_style="green",
+            expand=False,
+        )
+    )
+    if files_changed:
+        console.print(
+            "[dim]files changed:[/] " + ", ".join(files_changed)
+        )
+    else:
+        console.print("[dim]files changed: (none — no edit was needed)[/]")
+
+    return f"Task marked complete. Summary delivered to user. evidence accepted: {evidence}"
 
 
 # ---------- Tool schemas ----------
@@ -554,6 +633,55 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "task_complete",
+            "description": (
+                "Call this when the task is finished. The harness ENDS the loop only "
+                "when this tool succeeds — plain assistant text with no tool calls will "
+                "NOT end the run. The `summary` is the final answer delivered to the "
+                "user. `files_changed` lists paths you modified (empty list if no edit "
+                "was needed — say so in the summary; do NOT invent edits or fabricate a "
+                "bug that isn't there). `evidence` lists file paths you actually read "
+                "via read_file or saw matches for via search, in this session — the "
+                "harness verifies them. If you cite a file you didn't access, the call "
+                "fails and you'll be asked to either drop the citation or read the file. "
+                "Always anchor your summary to evidence you actually read."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": (
+                            "Final answer for the user. State what you did, what you "
+                            "found, and the outcome. If nothing needed changing, say so "
+                            "directly."
+                        ),
+                    },
+                    "files_changed": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Paths of files you modified during the task. Empty array "
+                            "if no edits were made."
+                        ),
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Paths of files you read or searched in this session that "
+                            "support your summary. The harness verifies each one was "
+                            "actually accessed."
+                        ),
+                    },
+                },
+                "required": ["summary", "files_changed", "evidence"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "bash",
             "description": (
                 "Run a shell command from the working directory. 30-second timeout. "
@@ -594,6 +722,7 @@ DISPATCH: dict[str, Callable[..., str]] = {
     "write_file": write_file,
     "replace_in_file": replace_in_file,
     "search": search,
+    "task_complete": task_complete,
     "bash": bash,
 }
 
@@ -612,9 +741,23 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
 
 # ---------- System prompt ----------
 _BASE_SYSTEM_PROMPT = """You are a focused coding agent operating in a single working \
-directory via five tools: read_file, write_file, replace_in_file, search, bash.
+directory via six tools: read_file, write_file, replace_in_file, search, bash, task_complete.
 
-Rules:
+Termination — read this carefully:
+- The session ends ONLY when you call task_complete and it validates. Plain text with no
+  tool calls will NOT end the run; you'll be nudged to call task_complete and the loop
+  will continue until you do (or hit the iteration cap).
+- task_complete takes (summary, files_changed, evidence). `evidence` is the list of file
+  paths you actually read or searched in this session — the harness verifies each one.
+  Inventing or guessing at evidence will fail; either drop the citation or read the file
+  first.
+- If the task did not require any edit (e.g., the bug doesn't exist, tests already pass,
+  the question is answered by inspection), set files_changed=[] and say so plainly in the
+  summary. Do NOT fabricate a bug, invent an edge case to "fix", or pretend to find an
+  issue that isn't there. Calling task_complete with files_changed=[] is a valid, complete
+  outcome.
+
+Tool rules:
 - To locate content across files, use the `search` tool (regex via ripgrep). Prefer it
   over reading many files when you don't yet know where something lives.
 - Always read a file before editing it. SEARCH text in replace_in_file blocks must match
@@ -629,10 +772,33 @@ Rules:
 - If a tool returns an error, read it carefully and adjust — do not repeat the same call.
 - When replace_in_file reports multiple matches, add more surrounding lines to the SEARCH
   section until it is unique.
-- Be terse in your final response. State what you did, which file you changed, and why.
+
+Style:
+- Be terse. State what you did, what you changed (if anything), and why.
 - Never invent file contents. If you need to know what's in a file, read it.
-- Stop iterating once the task is verifiably done. If there is no bug or no change needed,
-  say so explicitly rather than fabricating one.
+
+task_complete examples:
+
+  Example A — bug fixed:
+    task_complete(
+      summary="Fixed main.py: compute() now subtracts; test_main.py passes.",
+      files_changed=["main.py"],
+      evidence=["main.py", "test_main.py"]
+    )
+
+  Example B — no change needed (the failure mode this tool is designed to catch):
+    task_complete(
+      summary="Ran test_inventory.py — all tests pass. Reviewed inventory.py; no bug found.",
+      files_changed=[],
+      evidence=["inventory.py", "test_inventory.py"]
+    )
+
+  Example C — analysis / listing:
+    task_complete(
+      summary="Found 7 functions with >3 args: ...",
+      files_changed=[],
+      evidence=["auth.py", "db.py", "api.py", "utils.py", "handlers.py", "validation.py"]
+    )
 """
 
 
@@ -676,6 +842,9 @@ def run_agent(user_task: str, history: list[dict] | None = None) -> list[dict]:
         {"role": "system", "content": _build_system_prompt()}
     ]
     messages.append({"role": "user", "content": user_task})
+
+    global _RUN_COMPLETE
+    _RUN_COMPLETE = False
 
     for _ in range(MAX_ITERATIONS):
         try:
@@ -742,7 +911,24 @@ def run_agent(user_task: str, history: list[dict] | None = None) -> list[dict]:
         messages.append(assistant_msg)
 
         if not tool_calls:
-            return messages
+            # Model emitted a final-looking message but did not call task_complete.
+            # The session ends ONLY on task_complete; nudge the model and continue.
+            console.print(
+                "[dim yellow]  (no tool calls; nudging model to call task_complete)[/]"
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "You produced a message with no tool calls. To end the task "
+                        "you must call task_complete(summary, files_changed, evidence). "
+                        "If no edit was needed, set files_changed=[] and say so in the "
+                        "summary — do not fabricate an edit. evidence must list the "
+                        "file paths you actually read or searched in this session."
+                    ),
+                }
+            )
+            continue
 
         for i, tc in enumerate(tool_calls):
             name = tc["name"]
@@ -761,6 +947,9 @@ def run_agent(user_task: str, history: list[dict] | None = None) -> list[dict]:
             messages.append(
                 {"role": "tool", "tool_call_id": call_id, "content": result}
             )
+
+        if _RUN_COMPLETE:
+            return messages
 
     console.print(f"[red]Max iterations ({MAX_ITERATIONS}) reached without completion.[/]")
     return messages
