@@ -1,11 +1,40 @@
-# qwen-code (v0.1)
+# qwen-code (v1.0)
 
 A minimal Claude Code clone: a single-file CLI coding agent that uses a local Qwen model
-(via Ollama) as the brain, with four tools — `read_file`, `write_file`, `str_replace`, and
-`bash`.
+(via Ollama) as the brain, with five tools — `read_file`, `write_file`, `replace_in_file`,
+`search`, and `bash`.
 
 The goal is a working agentic loop in one file (`agent.py`) that can read a small codebase,
-make an edit, and run a test, autonomously.
+locate content with ripgrep, make edits, run tests, and ask for approval before risky
+shell commands — autonomously.
+
+## What changed in v1.0
+
+Better edits, model-driven approval, and search.
+
+- **`replace_in_file` replaces `str_replace`** — a more robust edit tool using fenced
+  SEARCH/REPLACE blocks (format borrowed from Aider/Cline). Eliminates JSON-string-escape
+  failure modes and lets the model batch multiple related edits in a single call.
+  Operation is all-or-nothing: if any block fails (zero or multiple matches, or the diff
+  is malformed), the file on disk is unchanged.
+  ```text
+  <<<<<<< SEARCH
+  exact text from the file
+  =======
+  replacement text
+  >>>>>>> REPLACE
+  ```
+- **`requires_approval` on `bash`** — the model itself flags risky commands. The schema's
+  required boolean parameter tells the harness whether to prompt the user before running.
+  Set true for destructive, install, network, or out-of-tree commands; false for read-only
+  ops and known-safe scripts. The harness shows the command in a yellow panel and waits
+  for `y/N`. Denial returns a tool result so the model can adjust.
+- **`--yolo` CLI flag** — bypasses every approval prompt and auto-approves. Prints a red
+  warning at startup. Useful for headless / sandboxed runs; use with caution.
+- **`search` tool** — shells out to ripgrep with `--line-number --no-heading --color=never`
+  (case-insensitive unless `case_sensitive=true`). Path resolves through `_resolve_path`,
+  so search stays inside the working directory. Output is `path:line:content`, capped at
+  100 matches with a hint to narrow.
 
 ## What changed in v0.1
 
@@ -37,7 +66,10 @@ The harness was made **self-describing** so the model can reason about it correc
   ```bash
   ollama pull qwen3-coder:30b
   ```
-- `rg` (ripgrep) on PATH if you want the agent to search efficiently
+- **`rg` (ripgrep) on `PATH`** — required for the `search` tool. There is no `grep`
+  fallback. Install: `brew install ripgrep` (macOS), `apt install ripgrep` (Debian/Ubuntu),
+  `pacman -S ripgrep` (Arch). The tool returns an actionable install hint if `rg` is
+  missing.
 
 ## Install
 
@@ -80,9 +112,25 @@ Point the agent at a different directory without `cd`-ing:
 python agent.py --project-root /tmp/qwen-test-1 "Run test_main.py and make it pass."
 ```
 
+Auto-approve every `bash` command (skip the `y/N` prompt — use with caution):
+
+```bash
+python agent.py --yolo "rebuild and run the full test suite"
+```
+
 The working directory is the resolved value of `--project-root` (or the launch cwd if the
 flag is omitted). File tools cannot escape it; `bash` runs with that as `cwd`, in a fresh
 subprocess each call.
+
+## Tools
+
+| Tool              | Purpose                                                                  |
+| ----------------- | ------------------------------------------------------------------------ |
+| `read_file`       | Read a file (≤ 2000 lines), with display-only line numbers.              |
+| `write_file`      | Create a NEW file. Fails if path exists — forces edits via replace_in_file. |
+| `replace_in_file` | Apply one or more fenced SEARCH/REPLACE blocks; all-or-nothing.          |
+| `search`          | Regex search via ripgrep across files; ≤ 100 matches.                    |
+| `bash`            | Run a shell command (30s timeout). Requires the model to flag risky commands via `requires_approval`. |
 
 ## How it works
 
@@ -91,16 +139,25 @@ subprocess each call.
 - Each iteration: stream the model's text to the terminal, collect any tool calls, execute
   them, feed results back as `tool` messages, repeat — up to `MAX_ITERATIONS` (25).
 - Tool calls are printed in cyan with their arguments truncated to 200 chars; tool results
-  are previewed at 500 chars in the UI but the full result is fed back to the model.
+  are previewed at 500 chars in the UI, but the full result is fed back to the model.
 - `bash` results are formatted as `exit code: N` + `--- stdout ---` + `--- stderr ---`,
   each stream capped at 5000 chars.
 - `read_file` prefixes every line with a right-aligned 4-char line number plus a tab. The
   system prompt tells the model these are display-only and must not appear in
-  `str_replace` arguments.
-- `write_file` refuses to overwrite — forces the agent to use `str_replace` for edits.
-- `str_replace` requires `old_str` to occur exactly once; on collision it returns each
-  match's line number so the agent can disambiguate.
+  `replace_in_file` SEARCH text.
+- `write_file` refuses to overwrite — forces the agent to use `replace_in_file` for edits.
+- `replace_in_file` parses the diff with a strict state machine; SEARCH must occur exactly
+  once in the current in-memory state of the file. On 0 matches, the error shows the first
+  20 lines; on >1 matches, the line numbers and 2 lines of context around each match. On
+  failure the file on disk is untouched, even if earlier blocks already applied in memory.
+- `search` shells out to `rg` with `--line-number --no-heading --color=never` and `-i`
+  unless `case_sensitive=true`. Results are capped at 100 matches.
+- When `bash` is called with `requires_approval=true` and `--yolo` is not set, the harness
+  prints the command in a yellow panel and waits for `y/N` on stdin. Denial returns a
+  tool result so the model can adjust.
 - All paths are resolved through `_resolve_path()` and must stay inside `WORKING_DIR`.
+  Symlinks pointing outside are rejected (realpath is checked against the working-dir
+  realpath).
 
 ## Config
 
@@ -135,10 +192,9 @@ python ~/projects/qwen-code/agent.py "run calc.py, if it fails fix the bug and r
 ```
 
 Expected behavior: the agent runs `calc.py`, sees the `AssertionError`, reads `calc.py`,
-uses `str_replace` to change `a - b` to `a + b`, re-runs, sees `ok`, and reports success.
+uses `replace_in_file` to change `a - b` to `a + b`, re-runs, sees `ok`, and reports success.
 
-## Out of scope for v0
+## Out of scope for v1.0
 
-Repo map / tree-sitter indexing, web search, MCP, subagents, diff preview/approval UI,
-sandboxing, conversation persistence, multi-file transactional edits, planning/todo tools.
-Those come in v1+.
+`list_directory`, repo map / tree-sitter indexing, web fetch, MCP support, subagents,
+conversation persistence, multi-file refactor across many edits. v1.1+ territory.
