@@ -129,7 +129,7 @@ def write_file(path: str, content: str) -> str:
             f"Error: file already exists: {path}\n"
             f"  resolved to: {p}\n"
             f"  working directory: {WORKING_DIR}\n"
-            f"  hint: write_file only creates new files. To edit, use str_replace."
+            f"  hint: write_file only creates new files. To edit, use replace_in_file."
         )
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
@@ -140,7 +140,144 @@ def write_file(path: str, content: str) -> str:
     return f"Wrote {path} ({n_lines} lines)"
 
 
-def str_replace(path: str, old_str: str, new_str: str) -> str:
+# ---------- Diff parsing for replace_in_file ----------
+SEARCH_FENCE = "<<<<<<< SEARCH"
+SEPARATOR_FENCE = "======="
+REPLACE_FENCE = ">>>>>>> REPLACE"
+
+
+def _parse_diff(diff: str) -> list[tuple[str, str]]:
+    """Parse a diff containing one or more SEARCH/REPLACE blocks.
+
+    Format (fence lines must appear alone on their own lines, exact spelling):
+        <<<<<<< SEARCH
+        old text
+        =======
+        new text
+        >>>>>>> REPLACE
+
+    Returns list of (search, replace) pairs in order. Raises ValueError on
+    malformed input with a message naming the offending line.
+    """
+    lines = diff.split("\n")
+    blocks: list[tuple[str, str]] = []
+    state = "between"  # between | in_search | in_replace
+    search_buf: list[str] = []
+    replace_buf: list[str] = []
+
+    for i, line in enumerate(lines, 1):
+        if state == "between":
+            if line.strip() == "":
+                continue
+            if line == SEARCH_FENCE:
+                state = "in_search"
+                search_buf, replace_buf = [], []
+            else:
+                raise ValueError(
+                    f"line {i}: expected {SEARCH_FENCE!r} to start a block, got {line!r}"
+                )
+        elif state == "in_search":
+            if line == SEPARATOR_FENCE:
+                state = "in_replace"
+            elif line in (SEARCH_FENCE, REPLACE_FENCE):
+                raise ValueError(
+                    f"line {i}: unexpected fence {line!r} inside SEARCH section; "
+                    f"did you forget the {SEPARATOR_FENCE!r} divider?"
+                )
+            else:
+                search_buf.append(line)
+        else:  # in_replace
+            if line == REPLACE_FENCE:
+                blocks.append(("\n".join(search_buf), "\n".join(replace_buf)))
+                state = "between"
+            elif line in (SEARCH_FENCE, SEPARATOR_FENCE):
+                raise ValueError(
+                    f"line {i}: unexpected fence {line!r} inside REPLACE section"
+                )
+            else:
+                replace_buf.append(line)
+
+    if state != "between":
+        raise ValueError(
+            f"unterminated block (state {state!r}); expected {REPLACE_FENCE!r} to close"
+        )
+    if not blocks:
+        raise ValueError("no SEARCH/REPLACE blocks found in diff")
+    return blocks
+
+
+_DIFF_FORMAT_EXAMPLE = (
+    "  <<<<<<< SEARCH\n"
+    "  exact text from the file\n"
+    "  =======\n"
+    "  replacement text\n"
+    "  >>>>>>> REPLACE"
+)
+
+
+def _no_match_error(
+    path_str: str, resolved: Path, text: str, block_idx: int, n_blocks: int
+) -> str:
+    lines = text.splitlines()
+    preview = "\n".join(f"  {i + 1:>4}\t{lines[i]}" for i in range(min(20, len(lines))))
+    block_note = (
+        f" (block {block_idx} of {n_blocks}; "
+        f"file on disk unchanged — preceding blocks were applied in memory only)"
+        if n_blocks > 1
+        else ""
+    )
+    return (
+        f"Error: SEARCH text not found in {path_str}{block_note}.\n"
+        f"  resolved to: {resolved}\n"
+        f"  current state is {len(lines)} lines; first 20 shown below:\n"
+        f"{preview}\n"
+        f"  hint: the SEARCH text was not found — check for whitespace, indentation, "
+        f"tabs vs spaces, or trailing spaces. Do NOT include the right-aligned "
+        f"line-number prefix from read_file output."
+    )
+
+
+def _multi_match_error(
+    path_str: str,
+    resolved: Path,
+    text: str,
+    search: str,
+    block_idx: int,
+    n_blocks: int,
+) -> str:
+    lines = text.splitlines()
+    matches: list[tuple[int, int]] = []
+    idx = 0
+    while True:
+        i = text.find(search, idx)
+        if i == -1:
+            break
+        start = text.count("\n", 0, i) + 1
+        end = start + search.count("\n")
+        matches.append((start, end))
+        idx = i + 1
+    match_lines = [s for s, _ in matches]
+
+    def _ctx(s: int, e: int) -> str:
+        s0, e0 = max(1, s - 2), min(len(lines), e + 2)
+        return "\n".join(f"  {j:>4}\t{lines[j - 1]}" for j in range(s0, e0 + 1))
+
+    ctx_blocks = "\n".join(
+        f"  Match {n} (lines {s}-{e}):\n{_ctx(s, e)}" for n, (s, e) in enumerate(matches, 1)
+    )
+    block_note = f" (block {block_idx} of {n_blocks})" if n_blocks > 1 else ""
+    return (
+        f"Error: SEARCH text matched {len(matches)} times in {path_str} at lines "
+        f"{match_lines}{block_note}.\n"
+        f"  resolved to: {resolved}\n"
+        f"{ctx_blocks}\n"
+        f"  hint: include more surrounding lines in the SEARCH section (above or below "
+        f"the target) to uniquely identify which match to change. No part of the file "
+        f"was modified."
+    )
+
+
+def replace_in_file(path: str, diff: str) -> str:
     try:
         p = _resolve_path(path)
     except PathError as e:
@@ -152,50 +289,29 @@ def str_replace(path: str, old_str: str, new_str: str) -> str:
             f"  working directory: {WORKING_DIR}\n"
             f"  hint: pass a path relative to the working directory."
         )
+
+    try:
+        blocks = _parse_diff(diff)
+    except ValueError as e:
+        return (
+            f"Error: malformed diff: {e}\n"
+            f"  expected format (one or more blocks):\n"
+            f"{_DIFF_FORMAT_EXAMPLE}\n"
+            f"  hint: each fence line must appear alone on its own line with exact spelling."
+        )
+
     text = p.read_text(encoding="utf-8")
-    count = text.count(old_str)
+    for n, (search, replace) in enumerate(blocks, 1):
+        count = text.count(search)
+        if count == 0:
+            return _no_match_error(path, p, text, n, len(blocks))
+        if count > 1:
+            return _multi_match_error(path, p, text, search, n, len(blocks))
+        text = text.replace(search, replace, 1)
 
-    if count == 0:
-        preview = _show_lines(p, 1, 20)
-        total_lines = text.count("\n") + (0 if text.endswith("\n") or text == "" else 1)
-        return (
-            f"Error: old_str not found in {path}.\n"
-            f"  resolved to: {p}\n"
-            f"  file is {total_lines} lines; first 20 shown below:\n"
-            f"{preview}\n"
-            f"  hint: the string was not found — check for whitespace, indentation, "
-            f"or character differences (e.g. tabs vs spaces, trailing spaces, line endings). "
-            f"Do NOT include the right-aligned line-number prefix from read_file output."
-        )
-
-    if count > 1:
-        # Locate every match with its starting line and ending line.
-        matches: list[tuple[int, int]] = []  # (start_line, end_line)
-        idx = 0
-        while True:
-            i = text.find(old_str, idx)
-            if i == -1:
-                break
-            start_line = text.count("\n", 0, i) + 1
-            end_line = start_line + old_str.count("\n")
-            matches.append((start_line, end_line))
-            idx = i + 1
-        match_lines = [s for s, _ in matches]
-        ctx_blocks: list[str] = []
-        for n, (s, e) in enumerate(matches, 1):
-            ctx_blocks.append(
-                f"  Match {n} (lines {s}-{e}):\n{_show_lines(p, s - 2, e + 2)}"
-            )
-        return (
-            f"Error: old_str matched {count} times in {path} at lines {match_lines}.\n"
-            f"  resolved to: {p}\n"
-            + "\n".join(ctx_blocks)
-            + "\n  hint: include more surrounding lines in old_str (above or below "
-            "the target) to uniquely identify the match you want to change."
-        )
-
-    p.write_text(text.replace(old_str, new_str, 1), encoding="utf-8")
-    return f"Replaced 1 occurrence in {path}"
+    p.write_text(text, encoding="utf-8")
+    n = len(blocks)
+    return f"Applied {n} block{'s' if n != 1 else ''} to {path}"
 
 
 def bash(command: str) -> str:
@@ -234,8 +350,8 @@ TOOLS: list[dict] = [
             "description": (
                 "Read a file from the working directory. Returns content with right-aligned "
                 "line numbers in a 4-character field followed by a tab, then the line content. "
-                "Line numbers are display-only — do NOT include them in str_replace arguments. "
-                "Capped at 2000 lines."
+                "Line numbers are display-only — do NOT include them in replace_in_file SEARCH "
+                "text. Capped at 2000 lines."
             ),
             "parameters": {
                 "type": "object",
@@ -252,7 +368,7 @@ TOOLS: list[dict] = [
             "name": "write_file",
             "description": (
                 "Create a NEW file with the given content. Fails if the path already exists — "
-                "use str_replace to edit existing files."
+                "use replace_in_file to edit existing files."
             ),
             "parameters": {
                 "type": "object",
@@ -267,25 +383,41 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "str_replace",
+            "name": "replace_in_file",
             "description": (
-                "Exact string replacement in an existing file. `old_str` must match the file "
-                "content character-for-character including whitespace and indentation. "
-                "Line-number prefixes shown by read_file (format: '   N<tab>...') are "
-                "display-only — do NOT include them in `old_str`. `old_str` must appear "
-                "EXACTLY ONCE; if it matches multiple locations, include more surrounding "
-                "lines until it is unique. On 0 matches the error shows the start of the "
-                "file; on >1 matches it shows context around each match so you can "
-                "disambiguate."
+                "Apply one or more fenced SEARCH/REPLACE blocks to an existing file. "
+                "The diff argument contains blocks in this exact format (fence lines must "
+                "appear alone on their own lines, exact spelling):\n"
+                "  <<<<<<< SEARCH\n"
+                "  exact text from the file\n"
+                "  =======\n"
+                "  replacement text\n"
+                "  >>>>>>> REPLACE\n"
+                "Multiple blocks can be stacked in one diff; they apply in order. The SEARCH "
+                "text in each block must match the file content character-for-character "
+                "including whitespace and indentation, and must appear EXACTLY ONCE in the "
+                "file's current state. If any block fails (zero or multiple matches, or the "
+                "diff is malformed), the entire operation aborts and the file on disk is "
+                "unchanged. Do NOT include the right-aligned line-number prefix from "
+                "read_file output in SEARCH text. If a SEARCH text would not be unique, "
+                "include more surrounding lines until it is."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Path relative to the working directory."},
-                    "old_str": {"type": "string", "description": "Exact text to find (unique within the file)."},
-                    "new_str": {"type": "string", "description": "Replacement text."},
+                    "path": {
+                        "type": "string",
+                        "description": "Path relative to the working directory.",
+                    },
+                    "diff": {
+                        "type": "string",
+                        "description": (
+                            "One or more SEARCH/REPLACE blocks. See the tool description "
+                            "for the exact fence format."
+                        ),
+                    },
                 },
-                "required": ["path", "old_str", "new_str"],
+                "required": ["path", "diff"],
             },
         },
     },
@@ -317,7 +449,7 @@ TOOLS: list[dict] = [
 DISPATCH: dict[str, Callable[..., str]] = {
     "read_file": read_file,
     "write_file": write_file,
-    "str_replace": str_replace,
+    "replace_in_file": replace_in_file,
     "bash": bash,
 }
 
@@ -336,18 +468,20 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
 
 # ---------- System prompt ----------
 _BASE_SYSTEM_PROMPT = """You are a focused coding agent operating in a single working \
-directory via four tools: read_file, write_file, str_replace, bash.
+directory via four tools: read_file, write_file, replace_in_file, bash.
 
 Rules:
-- Always read a file before editing it. Match old_str byte-for-byte from the file contents.
-- The right-aligned line-number prefix shown by read_file is display-only. Never include it
-  in str_replace arguments.
-- Prefer str_replace over rewriting a file. Use write_file only for brand-new files.
+- Always read a file before editing it. SEARCH text in replace_in_file blocks must match
+  the file's content byte-for-byte, including whitespace and indentation.
+- The right-aligned line-number prefix shown by read_file is display-only. Never include
+  it in replace_in_file SEARCH text.
+- Prefer replace_in_file over rewriting a file. Use write_file only for brand-new files.
+  replace_in_file accepts multiple SEARCH/REPLACE blocks in one call — group related edits.
 - For searching, use bash with ripgrep: `rg "pattern"` or `rg -l "pattern" path/`.
 - After modifying code, verify it with bash (run the script or its tests).
 - If a tool returns an error, read it carefully and adjust — do not repeat the same call.
-- When str_replace reports multiple matches, add more surrounding context to old_str until
-  it is unique.
+- When replace_in_file reports multiple matches, add more surrounding lines to the SEARCH
+  section until it is unique.
 - Be terse in your final response. State what you did, which file you changed, and why.
 - Never invent file contents. If you need to know what's in a file, read it.
 - Stop iterating once the task is verifiably done.
@@ -362,8 +496,8 @@ def _build_system_prompt() -> str:
     """
     wd_intro = (
         f"Your working directory is {WORKING_DIR}. "
-        f"The read_file, write_file, and str_replace tools resolve paths relative "
-        f"to this directory (or accept absolute paths within it). "
+        f"The read_file, write_file, and replace_in_file tools resolve paths "
+        f"relative to this directory (or accept absolute paths within it). "
         f"The bash tool also runs from this directory in a fresh subprocess each "
         f"call — `cd` inside a bash command will NOT persist to the next tool "
         f"call. To operate in a subdirectory, either pass relative paths to file "
