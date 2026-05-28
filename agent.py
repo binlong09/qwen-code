@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import subprocess
 from pathlib import Path
@@ -29,6 +30,7 @@ YOLO_MODE = False
 READ_FILE_MAX_LINES = 2000
 BASH_TIMEOUT = 30
 BASH_STREAM_CAP = 5000
+SEARCH_MAX_MATCHES = 100
 DISPLAY_ARGS_CAP = 200
 DISPLAY_RESULT_CAP = 500
 
@@ -377,6 +379,64 @@ def bash(command: str, requires_approval: bool) -> str:
     )
 
 
+def search(pattern: str, path: str = ".", case_sensitive: bool = False) -> str:
+    if shutil.which("rg") is None:
+        return (
+            "Error: ripgrep (rg) is not installed.\n"
+            "  install: `brew install ripgrep` (macOS) | `apt install ripgrep` "
+            "(Debian/Ubuntu) | `pacman -S ripgrep` (Arch)\n"
+            "  see https://github.com/BurntSushi/ripgrep#installation"
+        )
+    search_path = path or "."
+    try:
+        target = _resolve_path(search_path)
+    except PathError as e:
+        return f"Error: {e}"
+    if not target.exists():
+        return (
+            f"Error: search path not found: {search_path}\n"
+            f"  resolved to: {target}\n"
+            f"  working directory: {WORKING_DIR}"
+        )
+
+    cmd = ["rg", "--line-number", "--no-heading", "--color=never"]
+    if not case_sensitive:
+        cmd.append("-i")
+    cmd += ["--", pattern, search_path]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=BASH_TIMEOUT,
+            cwd=str(WORKING_DIR),
+        )
+    except subprocess.TimeoutExpired:
+        return f"Error: search timed out after {BASH_TIMEOUT}s for pattern {pattern!r}"
+
+    # rg exits 1 with empty output when there are no matches; that's not an error
+    if result.returncode == 1 and not result.stdout:
+        return f"No matches for pattern {pattern!r} in {search_path}"
+    if result.returncode not in (0, 1):
+        return (
+            f"Error: rg exited with code {result.returncode}\n"
+            f"--- stderr ---\n{result.stderr.strip()}"
+        )
+
+    out = result.stdout.rstrip("\n")
+    lines = out.split("\n") if out else []
+    total = len(lines)
+    if total > SEARCH_MAX_MATCHES:
+        body = "\n".join(lines[:SEARCH_MAX_MATCHES])
+        return (
+            f"{body}\n"
+            f"[...truncated: showing first {SEARCH_MAX_MATCHES} of {total} matches; "
+            f"narrow the pattern or path]"
+        )
+    return body if (body := "\n".join(lines)) else f"No matches for pattern {pattern!r} in {search_path}"
+
+
 # ---------- Tool schemas ----------
 TOOLS: list[dict] = [
     {
@@ -460,6 +520,40 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "search",
+            "description": (
+                "Search for content across files using ripgrep. Use search to find where "
+                "something is defined or used — prefer this over reading many files looking "
+                "for something specific. The pattern is a regex (ripgrep / Rust regex "
+                "syntax). Path is relative to the working directory; defaults to '.'. "
+                "Case-insensitive by default. Returns matches one per line as "
+                "'path:line:content', capped at 100 matches; narrow the pattern if "
+                "truncated. Use this before read_file when you don't yet know which file "
+                "contains what you need."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern (ripgrep / Rust regex syntax).",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory to search; relative to the working directory. Defaults to '.'.",
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "description": "If true, match case exactly. Defaults to false.",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "bash",
             "description": (
                 "Run a shell command from the working directory. 30-second timeout. "
@@ -499,6 +593,7 @@ DISPATCH: dict[str, Callable[..., str]] = {
     "read_file": read_file,
     "write_file": write_file,
     "replace_in_file": replace_in_file,
+    "search": search,
     "bash": bash,
 }
 
@@ -517,23 +612,27 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
 
 # ---------- System prompt ----------
 _BASE_SYSTEM_PROMPT = """You are a focused coding agent operating in a single working \
-directory via four tools: read_file, write_file, replace_in_file, bash.
+directory via five tools: read_file, write_file, replace_in_file, search, bash.
 
 Rules:
+- To locate content across files, use the `search` tool (regex via ripgrep). Prefer it
+  over reading many files when you don't yet know where something lives.
 - Always read a file before editing it. SEARCH text in replace_in_file blocks must match
   the file's content byte-for-byte, including whitespace and indentation.
 - The right-aligned line-number prefix shown by read_file is display-only. Never include
   it in replace_in_file SEARCH text.
 - Prefer replace_in_file over rewriting a file. Use write_file only for brand-new files.
   replace_in_file accepts multiple SEARCH/REPLACE blocks in one call — group related edits.
-- For searching, use bash with ripgrep: `rg "pattern"` or `rg -l "pattern" path/`.
 - After modifying code, verify it with bash (run the script or its tests).
+- For each bash call, set requires_approval=true for destructive, install, network, or
+  out-of-tree commands; false for read-only commands and known-safe scripts/tests.
 - If a tool returns an error, read it carefully and adjust — do not repeat the same call.
 - When replace_in_file reports multiple matches, add more surrounding lines to the SEARCH
   section until it is unique.
 - Be terse in your final response. State what you did, which file you changed, and why.
 - Never invent file contents. If you need to know what's in a file, read it.
-- Stop iterating once the task is verifiably done.
+- Stop iterating once the task is verifiably done. If there is no bug or no change needed,
+  say so explicitly rather than fabricating one.
 """
 
 
