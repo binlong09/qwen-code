@@ -68,6 +68,9 @@ SESSION_ACCESSED: set[Path] = set()
 # Set by task_complete on success; the agent loop checks it after each iteration
 # to exit cleanly. Reset at the start of every run_agent() call.
 _RUN_COMPLETE = False
+# Cumulative input/output token counts per model, keyed by ModelConfig.name.
+# Entries are created lazily on first use; /cost reads from here.
+TOKEN_USAGE: dict[str, dict[str, int]] = {}
 
 
 def _resolve_api_key(cfg: ModelConfig) -> str:
@@ -106,6 +109,13 @@ def _check_local_health(cfg: ModelConfig, timeout: float = 3.0) -> bool:
             return True
     except Exception:
         return False
+
+
+def _key_available(cfg: ModelConfig) -> bool:
+    """True if cfg's API key is set in the environment (always true for local)."""
+    if cfg.is_local:
+        return True
+    return bool(os.environ.get(cfg.api_key_env))
 
 READ_FILE_MAX_LINES = 2000
 BASH_TIMEOUT = 30
@@ -929,6 +939,11 @@ def run_agent(user_task: str, history: list[dict] | None = None) -> list[dict]:
     if ACTIVE_MODEL.is_local and ACTIVE_MODEL.default_keep_alive is not None:
         extra_body["keep_alive"] = ACTIVE_MODEL.default_keep_alive
 
+    # Per-model usage accumulator; ensure an entry exists at the start.
+    bucket = TOKEN_USAGE.setdefault(
+        ACTIVE_MODEL.name, {"in": 0, "out": 0, "calls": 0}
+    )
+
     for _ in range(MAX_ITERATIONS):
         try:
             create_kwargs: dict[str, Any] = dict(
@@ -936,6 +951,7 @@ def run_agent(user_task: str, history: list[dict] | None = None) -> list[dict]:
                 messages=messages,
                 tools=TOOLS,
                 stream=True,
+                stream_options={"include_usage": True},
             )
             if extra_body:
                 create_kwargs["extra_body"] = extra_body
@@ -947,9 +963,17 @@ def run_agent(user_task: str, history: list[dict] | None = None) -> list[dict]:
         text_parts: list[str] = []
         tool_calls_acc: dict[int, dict[str, str]] = {}
         text_started = False
+        prompt_tokens = 0
+        completion_tokens = 0
+        usage_seen = False
 
         try:
             for chunk in stream:
+                # The final include_usage chunk carries `usage` with empty choices.
+                if getattr(chunk, "usage", None):
+                    prompt_tokens = chunk.usage.prompt_tokens or 0
+                    completion_tokens = chunk.usage.completion_tokens or 0
+                    usage_seen = True
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -974,6 +998,11 @@ def run_agent(user_task: str, history: list[dict] | None = None) -> list[dict]:
         except Exception as e:
             console.print(f"\n[red]Streaming error:[/] {type(e).__name__}: {e}")
             return messages
+
+        if usage_seen:
+            bucket["in"] += prompt_tokens
+            bucket["out"] += completion_tokens
+            bucket["calls"] += 1
 
         if text_started:
             console.print()  # newline after streamed text
@@ -1084,6 +1113,83 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _slash_model(args: list[str]) -> None:
+    """Handle '/model', '/model local', '/model fallback' in the REPL."""
+    global ACTIVE_MODEL
+    if not args:
+        mode = "local" if ACTIVE_MODEL.is_local else "fallback"
+        console.print(
+            f"[dim]current:[/] {mode} ({ACTIVE_MODEL.name})  "
+            f"[dim]endpoint:[/] {ACTIVE_MODEL.api_base}"
+        )
+        return
+    target = args[0].lower()
+    if target == "local":
+        if not _check_local_health(LOCAL):
+            console.print(
+                f"[red]/model:[/] local appears unreachable; staying on "
+                f"{ACTIVE_MODEL.name}"
+            )
+            return
+        new = LOCAL
+    elif target == "fallback":
+        if not _key_available(FALLBACK):
+            console.print(
+                f"[red]/model:[/] {FALLBACK.api_key_env} is not set; staying "
+                f"on {ACTIVE_MODEL.name}"
+            )
+            return
+        new = FALLBACK
+    else:
+        console.print(
+            f"[red]/model:[/] unknown target {target!r}; use 'local' or 'fallback'"
+        )
+        return
+    if new is ACTIVE_MODEL:
+        console.print(f"[dim]/model:[/] already on {ACTIVE_MODEL.name}")
+        return
+    ACTIVE_MODEL = new
+    mode = "local" if ACTIVE_MODEL.is_local else "fallback"
+    style = "dim" if ACTIVE_MODEL.is_local else "bold yellow"
+    console.print(
+        f"[{style}]switched to {mode}: {ACTIVE_MODEL.name}[/] "
+        f"[dim](history preserved)[/]"
+    )
+
+
+def _slash_cost() -> None:
+    """Print cumulative per-model token tallies for this session."""
+    rows: list[tuple[str, dict[str, int]]] = []
+    for cfg in (LOCAL, FALLBACK):
+        usage = TOKEN_USAGE.get(cfg.name)
+        if usage is None:
+            continue
+        mode = "local" if cfg.is_local else "fallback"
+        rows.append((f"{mode} ({cfg.name}):", usage))
+    if not rows:
+        console.print("[dim]no completed model calls yet[/]")
+        return
+    width = max(len(label) for label, _ in rows)
+    for label, u in rows:
+        console.print(
+            f"{label.ljust(width)}  in={u['in']}  out={u['out']}  calls={u['calls']}"
+        )
+
+
+def _handle_slash(line: str) -> None:
+    """Dispatch a /<command> line entered in the REPL."""
+    parts = line.split()
+    head = parts[0].lower()
+    if head == "/model":
+        _slash_model(parts[1:])
+    elif head == "/cost":
+        _slash_cost()
+    else:
+        console.print(
+            f"[red]unknown command:[/] {head}. Available: /model, /cost"
+        )
+
+
 def _select_model(selected: str) -> ModelConfig:
     """Resolve --model {auto,local,fallback} to a concrete ModelConfig.
 
@@ -1149,7 +1255,10 @@ def main() -> None:
         run_agent(task)
         return
 
-    console.print("[bold]qwen-code[/] interactive. Type 'exit' or Ctrl-D to quit.")
+    console.print(
+        "[bold]qwen-code[/] interactive. Type 'exit' or Ctrl-D to quit. "
+        "Slash commands: /model, /cost."
+    )
     history: list[dict] = [{"role": "system", "content": _build_system_prompt()}]
     while True:
         try:
@@ -1157,9 +1266,13 @@ def main() -> None:
         except (EOFError, KeyboardInterrupt):
             console.print()
             break
-        if line.strip().lower() in {"exit", "quit"}:
+        stripped = line.strip()
+        if stripped.lower() in {"exit", "quit"}:
             break
-        if not line.strip():
+        if not stripped:
+            continue
+        if stripped.startswith("/"):
+            _handle_slash(stripped)
             continue
         history = run_agent(line, history)
 
