@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import subprocess
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -86,6 +87,25 @@ def _resolve_api_key(cfg: ModelConfig) -> str:
         f"https://platform.deepseek.com/api_keys and set it in your shell."
     )
     sys.exit(2)
+
+
+def _ollama_tags_url(cfg: ModelConfig) -> str:
+    """Convert an OpenAI-compat base (.../v1/ or .../v1) to Ollama's /api/tags URL."""
+    base = cfg.api_base.rstrip("/").removesuffix("/v1")
+    return f"{base}/api/tags"
+
+
+def _check_local_health(cfg: ModelConfig, timeout: float = 3.0) -> bool:
+    """True iff Ollama's /api/tags responds 200 with valid JSON within `timeout` seconds."""
+    url = _ollama_tags_url(cfg)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            if resp.status != 200:
+                return False
+            json.loads(resp.read().decode("utf-8"))
+            return True
+    except Exception:
+        return False
 
 READ_FILE_MAX_LINES = 2000
 BASH_TIMEOUT = 30
@@ -1041,6 +1061,22 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
              "requires_approval=true. Off by default. USE WITH CAUTION.",
     )
     parser.add_argument(
+        "--model",
+        choices=["auto", "local", "fallback"],
+        default="auto",
+        help="Which model to use. 'auto' (default) runs a 3s health check on "
+             "the local endpoint and falls back to DeepSeek if unreachable. "
+             "'local' skips the check and uses Ollama. 'fallback' skips the "
+             "check and uses DeepSeek.",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        help="Override the iteration cap. Defaults to the active model's "
+             "default (25 for local, 50 for fallback).",
+    )
+    parser.add_argument(
         "task",
         nargs="*",
         help="Task description. If omitted, drops into an interactive REPL.",
@@ -1048,10 +1084,32 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _select_model(selected: str) -> ModelConfig:
+    """Resolve --model {auto,local,fallback} to a concrete ModelConfig.
+
+    auto: health-check LOCAL; on failure, announce and fall back.
+    local: use LOCAL with no check (first request will surface any error).
+    fallback: use FALLBACK; verify API key up front so we fail fast.
+    """
+    if selected == "fallback":
+        _resolve_api_key(FALLBACK)  # may sys.exit
+        return FALLBACK
+    if selected == "local":
+        return LOCAL
+    # auto
+    if _check_local_health(LOCAL):
+        return LOCAL
+    console.print(
+        f"[bold yellow]Local unreachable, falling back to {FALLBACK.name}[/]"
+    )
+    _resolve_api_key(FALLBACK)  # may sys.exit (prints key + signup URL)
+    return FALLBACK
+
+
 def main() -> None:
     args = _parse_args(sys.argv[1:])
 
-    global WORKING_DIR, YOLO_MODE
+    global WORKING_DIR, YOLO_MODE, ACTIVE_MODEL, MAX_ITERATIONS
     if args.project_root is not None:
         root = Path(args.project_root).expanduser()
         try:
@@ -1070,6 +1128,13 @@ def main() -> None:
             "[bold red]WARNING:[/] --yolo is set. All bash commands will be "
             "auto-approved, including ones the model marks as destructive."
         )
+
+    ACTIVE_MODEL = _select_model(args.model)
+    MAX_ITERATIONS = (
+        args.max_iterations
+        if args.max_iterations is not None
+        else ACTIVE_MODEL.default_max_iterations
+    )
 
     mode = "local" if ACTIVE_MODEL.is_local else "fallback"
     style = "dim" if ACTIVE_MODEL.is_local else "bold yellow"
