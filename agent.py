@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Minimal Claude Code clone — v0.1. Single-file agent with 4 tools."""
+"""Minimal Claude Code clone — single-file agent with six tools."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,11 +17,44 @@ from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
 
-# ---------- Config ----------
-MODEL = "qwen3-coder:30b"
-BASE_URL = "http://openai:11434/v1"
-API_KEY = "ollama"  # any non-empty string; Ollama ignores it
-MAX_ITERATIONS = 25
+# ---------- Model configuration ----------
+@dataclass(frozen=True)
+class ModelConfig:
+    """Configuration for one OpenAI-compatible model endpoint."""
+    name: str                       # display name for prints
+    api_base: str                   # OpenAI-compat base URL, must end with /v1/ or /v1
+    model_id: str                   # the model string sent in the request
+    api_key_env: str                # env var name to read the key from
+    is_local: bool                  # affects health check + default keep_alive
+    default_max_iterations: int     # used when --max-iterations isn't passed
+    default_keep_alive: str | None  # for Ollama only; None for hosted
+
+
+LOCAL = ModelConfig(
+    name="qwen3-coder:30b",
+    api_base="http://openai:11434/v1/",
+    model_id="qwen3-coder:30b",
+    api_key_env="OLLAMA_API_KEY",
+    is_local=True,
+    default_max_iterations=25,
+    default_keep_alive="0",
+)
+
+FALLBACK = ModelConfig(
+    name="deepseek-v4-flash",
+    api_base="https://api.deepseek.com/v1/",
+    model_id="deepseek-v4-flash",
+    api_key_env="DEEPSEEK_API_KEY",
+    is_local=False,
+    default_max_iterations=50,
+    default_keep_alive=None,
+)
+
+# Currently active model; main() may reassign based on --model flag and health check.
+ACTIVE_MODEL: ModelConfig = LOCAL
+# Iteration cap for the agent loop; main() resets to ACTIVE_MODEL.default_max_iterations
+# (or --max-iterations if provided).
+MAX_ITERATIONS = LOCAL.default_max_iterations
 # WORKING_DIR is the root for all tool paths. Defaults to cwd at import; main()
 # may overwrite it from --project-root. Tools read this name fresh on each call,
 # so reassignment from main() takes effect immediately.
@@ -32,6 +67,25 @@ SESSION_ACCESSED: set[Path] = set()
 # Set by task_complete on success; the agent loop checks it after each iteration
 # to exit cleanly. Reset at the start of every run_agent() call.
 _RUN_COMPLETE = False
+
+
+def _resolve_api_key(cfg: ModelConfig) -> str:
+    """Return the API key for `cfg` from its env var, or exit with a clear error.
+
+    For local (Ollama) configs, falls back to the literal "ollama" — Ollama
+    ignores the value but the OpenAI client refuses to instantiate without one.
+    For hosted configs, missing key is fatal.
+    """
+    key = os.environ.get(cfg.api_key_env)
+    if key:
+        return key
+    if cfg.is_local:
+        return "ollama"
+    console.print(
+        f"[red]{cfg.api_key_env} is not set.[/] Get a key at "
+        f"https://platform.deepseek.com/api_keys and set it in your shell."
+    )
+    sys.exit(2)
 
 READ_FILE_MAX_LINES = 2000
 BASH_TIMEOUT = 30
@@ -837,7 +891,10 @@ def _print_tool_result(result: str) -> None:
 
 # ---------- Agent loop ----------
 def run_agent(user_task: str, history: list[dict] | None = None) -> list[dict]:
-    client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+    client = OpenAI(
+        base_url=ACTIVE_MODEL.api_base,
+        api_key=_resolve_api_key(ACTIVE_MODEL),
+    )
     messages = history if history is not None else [
         {"role": "system", "content": _build_system_prompt()}
     ]
@@ -846,14 +903,23 @@ def run_agent(user_task: str, history: list[dict] | None = None) -> list[dict]:
     global _RUN_COMPLETE
     _RUN_COMPLETE = False
 
+    # Ollama accepts a keep_alive hint via extra_body; hosted providers will
+    # reject unknown fields, so only send it for local.
+    extra_body: dict[str, Any] = {}
+    if ACTIVE_MODEL.is_local and ACTIVE_MODEL.default_keep_alive is not None:
+        extra_body["keep_alive"] = ACTIVE_MODEL.default_keep_alive
+
     for _ in range(MAX_ITERATIONS):
         try:
-            stream = client.chat.completions.create(
-                model=MODEL,
+            create_kwargs: dict[str, Any] = dict(
+                model=ACTIVE_MODEL.model_id,
                 messages=messages,
                 tools=TOOLS,
                 stream=True,
             )
+            if extra_body:
+                create_kwargs["extra_body"] = extra_body
+            stream = client.chat.completions.create(**create_kwargs)
         except Exception as e:
             console.print(f"[red]Model call failed:[/] {type(e).__name__}: {e}")
             return messages
@@ -1005,7 +1071,12 @@ def main() -> None:
             "auto-approved, including ones the model marks as destructive."
         )
 
-    console.print(f"[dim]model:[/] {MODEL}  [dim]working dir:[/] {WORKING_DIR}")
+    mode = "local" if ACTIVE_MODEL.is_local else "fallback"
+    style = "dim" if ACTIVE_MODEL.is_local else "bold yellow"
+    console.print(
+        f"[{style}]Using {mode}: {ACTIVE_MODEL.name}[/]  "
+        f"[dim]working dir:[/] {WORKING_DIR}"
+    )
 
     if args.task:
         task = " ".join(args.task)
