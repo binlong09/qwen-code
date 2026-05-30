@@ -1,12 +1,34 @@
-# qwen-code (v1.1)
+# qwen-code (v1.2)
 
 A minimal Claude Code clone: a single-file CLI coding agent that uses a local Qwen model
-(via Ollama) as the brain, with six tools — `read_file`, `write_file`, `replace_in_file`,
-`search`, `bash`, and `task_complete`.
+(via Ollama) as the brain — with a hosted DeepSeek fallback for when the local endpoint
+is unreachable. Six tools: `read_file`, `write_file`, `replace_in_file`, `search`, `bash`,
+and `task_complete`.
 
 The goal is a working agentic loop in one file (`agent.py`) that can read a small codebase,
 locate content with ripgrep, make edits, run tests, ask for approval before risky shell
 commands, and explicitly signal completion with verified evidence — autonomously.
+
+## What changed in v1.2
+
+A hosted fallback so the agent still runs when the local Ollama is unreachable.
+
+- **`ModelConfig` dataclass** — model identity, endpoint, key env var, iteration cap, and
+  Ollama `keep_alive` are all configured as data on a frozen dataclass. Two configs ship:
+  `LOCAL` (qwen3-coder:30b via Ollama) and `FALLBACK` (deepseek-v4-flash via
+  `api.deepseek.com/v1`). `ACTIVE_MODEL` is selected once at startup.
+- **`--model {auto,local,fallback}` flag** — default `auto` runs a 3-second `GET` to
+  Ollama's `/api/tags` and uses LOCAL if it responds 200 with valid JSON. On failure it
+  prints `Local unreachable, falling back to deepseek-v4-flash` (yellow) and uses FALLBACK,
+  exiting non-zero if `DEEPSEEK_API_KEY` is missing. `local` and `fallback` skip the check.
+- **`--max-iterations N`** — overrides the cap; defaults to the active model's default
+  (25 for local, 50 for fallback).
+- **Startup banner names the active mode** — `Using local: qwen3-coder:30b` or
+  `Using fallback: deepseek-v4-flash` (yellow when fallback is active).
+- **`/model` and `/cost` slash commands** in the REPL — `/model` prints the current model
+  and endpoint; `/model local` and `/model fallback` switch mid-session (history is
+  preserved; switch is refused if the target isn't usable). `/cost` prints cumulative
+  per-model token tallies pulled from each response's `usage` field.
 
 ## What changed in v1.1
 
@@ -83,9 +105,10 @@ The harness was made **self-describing** so the model can reason about it correc
 ## Prereqs
 
 - **Python 3.11+**
-- **Ollama** running and reachable at `http://openai:11434/v1`
-  (override `BASE_URL` in `agent.py` if your Ollama lives elsewhere, e.g. `http://localhost:11434/v1`)
-- The model from the config block in `agent.py` pulled into Ollama:
+- **Ollama** running and reachable at `http://openai:11434/v1/`
+  (edit `LOCAL.api_base` in `agent.py` if your Ollama lives elsewhere, e.g.
+  `http://localhost:11434/v1/`)
+- The local model pulled into Ollama:
   ```bash
   ollama pull qwen3-coder:30b
   ```
@@ -93,6 +116,12 @@ The harness was made **self-describing** so the model can reason about it correc
   fallback. Install: `brew install ripgrep` (macOS), `apt install ripgrep` (Debian/Ubuntu),
   `pacman -S ripgrep` (Arch). The tool returns an actionable install hint if `rg` is
   missing.
+- **`DEEPSEEK_API_KEY` (optional)** — only needed if you want the fallback to engage when
+  Ollama is unreachable, or if you intend to use `--model fallback` directly. Get a key
+  at <https://platform.deepseek.com/api_keys>. Set in your shell, e.g.:
+  ```bash
+  export DEEPSEEK_API_KEY=sk-...
+  ```
 
 ## Install
 
@@ -139,6 +168,25 @@ Auto-approve every `bash` command (skip the `y/N` prompt — use with caution):
 
 ```bash
 python agent.py --yolo "rebuild and run the full test suite"
+```
+
+Pick a model explicitly (skip the auto health check):
+
+```bash
+python agent.py --model local    "..."  # force Ollama
+python agent.py --model fallback "..."  # force DeepSeek (needs DEEPSEEK_API_KEY)
+```
+
+Switch models mid-session from the REPL:
+
+```text
+> /model
+current: local (qwen3-coder:30b)  endpoint: http://openai:11434/v1/
+> /model fallback
+switched to fallback: deepseek-v4-flash (history preserved)
+> /cost
+local (qwen3-coder:30b):     in=12450  out=3210  calls=8
+fallback (deepseek-v4-flash):  in=4820   out=890   calls=3
 ```
 
 The working directory is the resolved value of `--project-root` (or the launch cwd if the
@@ -188,13 +236,31 @@ subprocess each call.
 
 ## Config
 
-Edit the top of `agent.py`:
+Models are configured as `ModelConfig` dataclass instances near the top of `agent.py`:
 
 ```python
-MODEL = "qwen3-coder:30b"
-BASE_URL = "http://openai:11434/v1"
-MAX_ITERATIONS = 25
+LOCAL = ModelConfig(
+    name="qwen3-coder:30b",
+    api_base="http://openai:11434/v1/",
+    model_id="qwen3-coder:30b",
+    api_key_env="OLLAMA_API_KEY",
+    is_local=True,
+    default_max_iterations=25,
+    default_keep_alive="0",
+)
+
+FALLBACK = ModelConfig(
+    name="deepseek-v4-flash",
+    api_base="https://api.deepseek.com/v1/",
+    model_id="deepseek-v4-flash",
+    api_key_env="DEEPSEEK_API_KEY",
+    is_local=False,
+    default_max_iterations=50,
+    default_keep_alive=None,
+)
 ```
+
+Override the iteration cap at runtime with `--max-iterations N`.
 
 ## Acceptance test
 
@@ -221,7 +287,10 @@ python ~/projects/qwen-code/agent.py "run calc.py, if it fails fix the bug and r
 Expected behavior: the agent runs `calc.py`, sees the `AssertionError`, reads `calc.py`,
 uses `replace_in_file` to change `a - b` to `a + b`, re-runs, sees `ok`, and reports success.
 
-## Out of scope for v1.1
+## Out of scope for v1.2
 
+Per-call retry / automatic in-session failover (health check is startup-only),
+per-model system prompt variants, DeepSeek-specific reasoning parameters, dollar-cost
+estimation, third providers (Anthropic, OpenAI), session log persistence,
 `list_directory`, repo map / tree-sitter indexing, web fetch, MCP support, subagents,
-conversation persistence, multi-file refactor across many edits. v1.2+ territory.
+conversation persistence across processes, multi-file refactor across many edits.
