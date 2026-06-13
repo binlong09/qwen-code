@@ -11,19 +11,26 @@ commands, and explicitly signal completion with verified evidence — autonomous
 
 ## Demo
 
-The agent running the acceptance test: it runs `calc.py`, sees the `AssertionError`,
-reads the file, fixes the bug with `replace_in_file`, re-runs until it passes, and
-signals completion.
+The agent fixing a bug in a small multi-file project: it locates the broken
+discount with `search`, reads `pricing.py`, edits it with `replace_in_file`,
+re-runs `test_cart.py` to confirm, and ends by calling `task_complete` with
+harness-verified evidence.
 
-![qwen-code fixing a failing test](coding-agent-demo.gif)
+![qwen-code finding and fixing a bug across a multi-file project](coding-agent-demo.gif)
 
 The recording is scripted with [VHS](https://github.com/charmbracelet/vhs) in
-`demo.tape` — it sets up the buggy `calc.py`, invokes the agent, and renders both
-`coding-agent-demo.gif` and `coding-agent-demo.mp4`. Regenerate with:
+`demo.tape`. It copies the version-controlled fixture in `demo/fixture/` into a
+scratch directory (so the recording never touches the repo) and runs the agent
+against it. Because the local 30b runs in real time (~2 min), `demo.tape` writes
+a raw capture and `demo/speed.sh` post-processes it into the final, sped-up
+`coding-agent-demo.mp4` and a light `coding-agent-demo.gif`:
 
 ```bash
-vhs demo.tape
+vhs demo.tape && ./demo/speed.sh
 ```
+
+`demo-calc.tape` is a minimal single-file fallback (the `calc.py` acceptance
+test) kept in case the richer demo doesn't render cleanly.
 
 ## What changed in v1.2
 

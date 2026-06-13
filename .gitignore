@@ -48,3 +48,4 @@ htmlcov/
 *.swp
 *.swo
 .DS_Store
+/coding-agent-demo-raw.mp4
