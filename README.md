@@ -9,6 +9,22 @@ The goal is a working agentic loop in one file (`agent.py`) that can read a smal
 locate content with ripgrep, make edits, run tests, ask for approval before risky shell
 commands, and explicitly signal completion with verified evidence — autonomously.
 
+## Demo
+
+The agent running the acceptance test: it runs `calc.py`, sees the `AssertionError`,
+reads the file, fixes the bug with `replace_in_file`, re-runs until it passes, and
+signals completion.
+
+![qwen-code fixing a failing test](coding-agent-demo.gif)
+
+The recording is scripted with [VHS](https://github.com/charmbracelet/vhs) in
+`demo.tape` — it sets up the buggy `calc.py`, invokes the agent, and renders both
+`coding-agent-demo.gif` and `coding-agent-demo.mp4`. Regenerate with:
+
+```bash
+vhs demo.tape
+```
+
 ## What changed in v1.2
 
 A hosted fallback so the agent still runs when the local Ollama is unreachable.
